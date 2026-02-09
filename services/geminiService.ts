@@ -1,101 +1,70 @@
-import { GoogleGenAI, GenerateContentResponse } from "@google/genai";
-import { CeeKnowledgeItem, GroundingSource } from "../types";
+import os
+from google import genai
+from google.genai import types
+from typing import List, Dict, Any, Generator
 
-// Modèle recommandé pour les tâches générales
-const MODEL_NAME = 'gemini-3-flash-preview';
+class GeminiService:
+    def __init__(self):
+        api_key = os.environ.get("API_KEY")
+        if not api_key:
+            raise ValueError("La variable d'environnement API_KEY est manquante.")
+        
+        # Initialisation du client avec la nouvelle syntaxe google-genai
+        self.client = genai.Client(api_key=api_key)
+        self.model_name = 'gemini-3-flash-preview'
 
-export interface AssistantStreamResult {
-  stream: AsyncIterable<GenerateContentResponse>;
-  getGroundingSources: (finalResponse: GenerateContentResponse) => GroundingSource[];
-}
+    def ask_expert_stream(self, query: str, context: List[Dict[str, Any]], ref_date: str) -> Generator[Any, None, None]:
+        """Générateur stream pour les réponses de l'expert CEE."""
+        
+        policy_ctx = "\n".join([f"[DOC] {i['title']}: {i['content']} (Source: {i['url']})" 
+                               for i in context if i['type'] != 'FICHE'])
+        fiche_ctx = "\n".join([f"[FICHE] {i['code']}: {i['title']}. Date: {i['versionDate']}. Contenu: {i['content']}" 
+                              for i in context if i['type'] == 'FICHE'])
 
-/**
- * Fonction helper pour extraire les sources sans dépendre d'une fermeture complexe
- */
-const extractSources = (finalResponse: GenerateContentResponse, contextItems: CeeKnowledgeItem[]): GroundingSource[] => {
-  const sources: GroundingSource[] = [];
-  
-  // 1. Google Search Grounding
-  const chunks = finalResponse.candidates?.[0]?.groundingMetadata?.groundingChunks;
-  if (chunks && Array.isArray(chunks)) {
-    chunks.forEach((chunk: any) => {
-      if (chunk.web && chunk.web.uri) {
-        sources.push({
-          title: chunk.web.title || "Source Web",
-          url: chunk.web.uri
-        });
-      }
-    });
-  }
-
-  // 2. Cross-referencing local context
-  const text = finalResponse.text || "";
-  const lowerText = text.toLowerCase();
-  
-  contextItems.forEach((item) => {
-    const identifier = (item.code || item.title).toLowerCase();
-    if (lowerText.includes(identifier)) {
-      sources.push({
-        title: item.code || item.title,
-        url: item.url
-      });
-    }
-  });
-
-  // 3. Deduplicate
-  const uniqueMap = new Map<string, GroundingSource>();
-  sources.forEach(s => uniqueMap.set(s.url, s));
-  
-  return Array.from(uniqueMap.values());
-};
-
-export const askCeeExpertStream = async (
-  query: string,
-  contextItems: CeeKnowledgeItem[],
-  referenceDate: string
-): Promise<AssistantStreamResult> => {
-  const apiKey = process.env.API_KEY || "";
-  
-  if (!apiKey) {
-    throw new Error("La clé API est absente des variables d'environnement.");
-  }
-
-  const ai = new GoogleGenAI({ apiKey: apiKey });
-
-  const policyContext = contextItems
-    .filter(i => i.type !== 'FICHE')
-    .map(i => `[DOC] ${i.title}: ${i.content} (Source: ${i.url})`)
-    .join('\n');
-
-  const ficheContext = contextItems
-    .filter(i => i.type === 'FICHE')
-    .map(i => `[FICHE] ${i.code}: ${i.title}. Date: ${i.versionDate}. Contenu: ${i.content}`)
-    .join('\n');
-
-  const systemInstruction = `Tu es un expert du dispositif CEE (Certificats d'Économies d'Énergie) pour le Ministère de la Transition Écologique.
-Date du jour : ${new Date(referenceDate).toLocaleDateString('fr-FR')}.
+        sys_inst = f"""Tu es un expert du dispositif CEE pour le Ministère de la Transition Écologique.
+Date de référence réglementaire : {ref_date}.
 
 INSTRUCTIONS :
-1. Utilise prioritairement le contexte local fourni.
-2. Utilise Google Search pour les dernières actualités.
-3. Cite systématiquement les fiches (ex: BAR-TH-164).
+1. Utilise le contexte local fourni prioritairement pour tes réponses.
+2. Si le contexte local ne suffit pas, utilise tes connaissances et Google Search pour compléter.
+3. Cite TOUJOURS les codes des fiches (ex: BAR-TH-164) quand tu les mentionnes.
 
 CONTEXTE LOCAL :
-${policyContext || 'Aucun doc général.'}
-${ficheContext || 'Aucune fiche technique.'}`;
+{policy_ctx}
+{fiche_ctx}"""
 
-  const responseStream = await ai.models.generateContentStream({
-    model: MODEL_NAME,
-    contents: [{ parts: [{ text: query }] }],
-    config: {
-      systemInstruction: systemInstruction,
-      temperature: 0.1,
-      tools: [{ googleSearch: {} }]
-    }
-  });
+        # Appel au modèle en mode streaming
+        # Le SDK Python attend souvent une liste pour contents
+        stream = self.client.models.generate_content_stream(
+            model=self.model_name,
+            contents=[query],
+            config=types.GenerateContentConfig(
+                system_instruction=sys_inst,
+                temperature=0.1,
+                tools=[types.Tool(google_search=types.GoogleSearch())]
+            )
+        )
+        
+        yield from stream
 
-  return {
-    stream: responseStream,
-    getGroundingSources: (resp: GenerateContentResponse) => extractSources(resp, contextItems)
-  };
-};
+    @staticmethod
+    def extract_sources(response: Any) -> List[Dict[str, str]]:
+        """Extrait les sources de grounding du dernier chunk de la réponse."""
+        sources = []
+        try:
+            # En Python, on accède aux attributs en snake_case
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                if hasattr(candidate, 'grounding_metadata') and candidate.grounding_metadata:
+                    metadata = candidate.grounding_metadata
+                    if hasattr(metadata, 'grounding_chunks') and metadata.grounding_chunks:
+                        for chunk in metadata.grounding_chunks:
+                            if chunk.web:
+                                sources.append({
+                                    "title": chunk.web.title or "Lien Web",
+                                    "url": chunk.web.uri
+                                })
+        except Exception as e:
+            print(f"Erreur lors de l'extraction des sources : {e}")
+            
+        return sources
