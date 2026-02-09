@@ -42,13 +42,18 @@ st.markdown("""
         margin-top: 8px;
         color: var(--indigo-electrique);
         text-decoration: none;
+        transition: all 0.2s;
+    }
+    .source-pill:hover {
+        border-color: var(--indigo-electrique);
+        background-color: #f8f9ff;
     }
 </style>
 """, unsafe_allow_html=True)
 
 # Initialisation de l'état
 if "messages" not in st.session_state:
-    st.session_state.messages = [{"role": "assistant", "content": "Bienvenue sur l'Expertise CEE. Scannez le portail pour commencer."}]
+    st.session_state.messages = [{"role": "assistant", "content": "Bienvenue sur l'Expertise CEE. Scannez le portail pour charger les fiches BAR/BAT/IND."}]
 if "items" not in st.session_state:
     st.session_state.items = []
 if "indexed" not in st.session_state:
@@ -60,35 +65,36 @@ with st.sidebar:
     st.divider()
     
     if st.button("🔍 Scanner le portail CEE"):
-        with st.spinner("Extraction en cours..."):
+        with st.spinner("Extraction des fiches ministérielles..."):
             st.session_state.items = CeeService.mock_scrape_cee()
             st.session_state.indexed = True
-            st.success(f"{len(st.session_state.items)} documents indexés.")
+            st.success(f"{len(st.session_state.items)} fiches indexées.")
             
     ref_date = st.date_input("Date de référence réglementaire", datetime.date.today())
     
     if st.session_state.indexed:
         effective_items = CeeService.get_effective_knowledge(st.session_state.items, ref_date)
-        st.markdown(f"**Corpus actif :** {len(effective_items)} fiches")
+        st.markdown(f"**Corpus actif :** {len(effective_items)} documents")
         for item in effective_items:
             with st.expander(f"{item.get('code', 'DOC')} - {item['title'][:20]}..."):
-                st.caption(f"Version: {item['versionDate']}")
+                st.caption(f"Applicable le : {item['versionDate']}")
                 st.write(item['content'])
 
 # Zone de Chat
 st.title("🛡️ Expertise Réglementaire CEE")
-st.caption(f"Mode Expert actif • Date de référence : {ref_date.strftime('%d/%m/%Y')}")
+st.caption(f"Mode RAG actif • Analyse basée sur la réglementation au {ref_date.strftime('%d/%m/%Y')}")
 
+# Affichage de l'historique
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.write(msg["content"])
         if "sources" in msg and msg["sources"]:
-            cols = st.columns(len(msg["sources"]))
-            for i, src in enumerate(msg["sources"]):
+            st.markdown("---")
+            for src in msg["sources"]:
                 st.markdown(f'<a href="{src["url"]}" class="source-pill" target="_blank">📄 {src["title"]}</a>', unsafe_allow_html=True)
 
-# Input
-if prompt := st.chat_input("Posez votre question sur les fiches BAR, BAT ou IND..."):
+# Input utilisateur
+if prompt := st.chat_input("Ex: Quelles sont les exigences pour la BAR-TH-164 ?"):
     st.session_state.messages.append({"role": "user", "content": prompt})
     with st.chat_message("user"):
         st.write(prompt)
@@ -101,28 +107,35 @@ if prompt := st.chat_input("Posez votre question sur les fiches BAR, BAT ou IND.
             gemini = GeminiService()
             effective_context = CeeService.get_effective_knowledge(st.session_state.items, ref_date)
             
+            # Appel au service (qui est maintenant un générateur propre)
             stream = gemini.ask_expert_stream(prompt, effective_context, ref_date.isoformat())
             
-            final_resp_obj = None
+            last_chunk = None
             for chunk in stream:
                 if chunk.text:
                     full_response += chunk.text
                     placeholder.markdown(full_response + "▌")
-                final_resp_obj = chunk
+                last_chunk = chunk
             
             placeholder.markdown(full_response)
             
-            # Extraction des sources
+            # Extraction et affichage des sources
             sources = []
-            if final_resp_obj:
-                sources = GeminiService.extract_sources(final_resp_obj)
+            if last_chunk:
+                sources = GeminiService.extract_sources(last_chunk)
                 if sources:
+                    st.markdown("---")
                     for src in sources:
                         st.markdown(f'<a href="{src["url"]}" class="source-pill" target="_blank">📄 {src["title"]}</a>', unsafe_allow_html=True)
             
-            st.session_state.messages.append({"role": "assistant", "content": full_response, "sources": sources})
+            # Sauvegarde dans l'historique
+            st.session_state.messages.append({
+                "role": "assistant", 
+                "content": full_response, 
+                "sources": sources
+            })
             
         except Exception as e:
-            st.error(f"Erreur : {str(e)}")
+            st.error(f"Une erreur est survenue : {str(e)}")
             if "API_KEY" not in os.environ:
-                st.info("Vérifiez que la variable d'environement API_KEY est configurée.")
+                st.warning("La clé API Gemini (API_KEY) n'est pas configurée dans les secrets de l'application.")
